@@ -1,0 +1,122 @@
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.optim as optim
+
+data = np.load("20000.npy")
+df = pd.DataFrame(data)
+df["palya_id"] = df["eventID"].astype(str) + "_" + df["trackID"].astype(str)
+primeries = df[df["parentID"] == 0]
+
+parameters = ['posX', 'posY', 'edep'] 
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+epochs = 1000
+batch_size = 128
+
+layers = [primeries[primeries["volumeID[3]"] == i].drop_duplicates(subset=["palya_id"]) for i in range(3)]
+
+def prepare_layer_pair_data(layerA, layerB):
+    common_labels = np.array(list(set(layerA["palya_id"]) & set(layerB["palya_id"])))
+    np.random.shuffle(common_labels)
+
+    split = int(0.9 * len(common_labels))
+    train_labels, val_labels = common_labels[:split], common_labels[split:]
+
+    l_train = [
+        layerA[layerA["palya_id"].isin(train_labels)].set_index("palya_id").loc[train_labels],
+        layerB[layerB["palya_id"].isin(train_labels)].set_index("palya_id").loc[train_labels]
+    ]
+    l_val = [
+        layerA[layerA["palya_id"].isin(val_labels)].set_index("palya_id").loc[val_labels],
+        layerB[layerB["palya_id"].isin(val_labels)].set_index("palya_id").loc[val_labels]
+    ]
+
+    x_mean = torch.tensor(l_train[0][parameters].values.mean(axis=0), dtype=torch.float32)
+    x_std = torch.tensor(l_train[0][parameters].values.std(axis=0), dtype=torch.float32) + 1e-6
+
+    return l_train, l_val, train_labels, val_labels, x_mean, x_std
+
+
+class Matcher(nn.Module):
+    def __init__(self, input_dim, hidden_dim=32):
+        super().__init__()
+        self.ql = nn.Linear(input_dim, hidden_dim)
+        self.kl = nn.Linear(input_dim, hidden_dim)
+
+    def match(self, x_prev, x_next):
+        q = self.ql(x_prev)
+        k = self.kl(x_next)
+        dm = q @ k.t()
+        return torch.softmax(dm, dim=1)
+
+# --- Tanítás ---
+def train_model_for_pair(pair_name, l_train, l_val, train_labels, val_labels, x_mean, x_std):
+    print(f"\n--- {pair_name} ---")
+    
+    model = Matcher(len(parameters), hidden_dim=32).to(device)
+    optimizer = optim.Adam(model.parameters(), lr=1e-4)
+    
+    history = {'train_acc': [], 'val_acc': []}
+
+    for e in range(epochs):
+        model.train()
+        np.random.shuffle(train_labels)
+        train_accs = []
+        
+        for i in range(0, len(train_labels), batch_size):
+            batch_labels = train_labels[i:i+batch_size]
+            if len(batch_labels) < 2: continue
+                
+            xs = []
+            for df_lay in l_train:
+                subset = df_lay.loc[batch_labels]
+                X = (torch.tensor(subset[parameters].values, dtype=torch.float32) - x_mean) / x_std
+                xs.append(X.to(device))
+            
+            optimizer.zero_grad()
+            probs = model.match(xs[0], xs[1])
+            targets = torch.arange(len(batch_labels)).to(device)
+            
+            loss = nn.functional.nll_loss(torch.log(probs + 1e-8), targets)
+            loss.backward()
+            optimizer.step()
+            
+            acc = (torch.argmax(probs, dim=1) == targets).float().mean().item() * 100
+            train_accs.append(acc)
+            
+        mean_train_acc = np.mean(train_accs)
+        history['train_acc'].append(mean_train_acc)
+
+        # Validáció
+        model.eval()
+        val_accuracies = []
+        with torch.no_grad():
+            for i in range(0, len(val_labels), 512):
+                v_batch_labels = val_labels[i:i+512]
+                if len(v_batch_labels) < 2: continue
+                
+                v_xs = []
+                for df_lay in l_val:
+                    subset = df_lay.loc[v_batch_labels]
+                    v_X = (torch.tensor(subset[parameters].values, dtype=torch.float32) - x_mean) / x_std
+                    v_xs.append(v_X.to(device))
+                
+                v_targets = torch.arange(len(v_batch_labels)).to(device)
+                v_probs = model.match(v_xs[0], v_xs[1])
+                acc = (torch.argmax(v_probs, dim=1) == v_targets).float().mean().item() * 100
+                val_accuracies.append(acc)
+                
+        mean_val_acc = np.mean(val_accuracies)
+        history['val_acc'].append(mean_val_acc)
+
+        if e % 100 == 0:
+            print(f"Epoch {e:4d} | Train Acc: {mean_train_acc:5.1f}% | Val Acc: {mean_val_acc:5.1f}%")
+
+    return model, history
+
+l1_train, l1_val, t_labels_1, v_labels_1, mean_1, std_1 = prepare_layer_pair_data(layers[0], layers[1])
+model_L1_L2, hist_L1_L2 = train_model_for_pair("L1-L2 Modell", l1_train, l1_val, t_labels_1, v_labels_1, mean_1, std_1)
+
+l2_train, l2_val, t_labels_2, v_labels_2, mean_2, std_2 = prepare_layer_pair_data(layers[1], layers[2])
+model_L2_L3, hist_L2_L3 = train_model_for_pair("L2-L3 Modell", l2_train, l2_val, t_labels_2, v_labels_2, mean_2, std_2)
